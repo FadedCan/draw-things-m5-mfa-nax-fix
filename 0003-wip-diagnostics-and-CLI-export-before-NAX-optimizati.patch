@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:31:06 +0800
+Subject: [PATCH 3/4] wip: diagnostics and CLI export before NAX optimization
+
+---
+ Apps/DrawThingsCLI/DrawThingsCLI.swift      | 35 ++++++++++++++++++++-
+ Libraries/Trainer/Sources/LoRATrainer.swift | 18 +++++++++--
+ Package.resolved                            | 24 --------------
+ 3 files changed, 50 insertions(+), 27 deletions(-)
+
+diff --git a/Apps/DrawThingsCLI/DrawThingsCLI.swift b/Apps/DrawThingsCLI/DrawThingsCLI.swift
+index d5989e9..4389b44 100644
+--- a/Apps/DrawThingsCLI/DrawThingsCLI.swift
++++ b/Apps/DrawThingsCLI/DrawThingsCLI.swift
+@@ -4194,7 +4194,7 @@ public struct DrawThingsCLI: ParsableCommand {
+     abstract: "Local inference and training CLI for Draw Things models.",
+     discussion: CLIHelpText.root,
+     version: CLIIdentity.version,
+-    subcommands: [Generate.self, Auth.self, Models.self, Train.self, Completion.self]
++    subcommands: [Generate.self, Auth.self, Models.self, Train.self, Export.self, Completion.self]
+   )
+ 
+   private static let invocationCondition = NSCondition()
+@@ -5218,6 +5218,39 @@ extension DrawThingsCLI {
+     }
+   }
+ 
++  struct Export: ParsableCommand {
++    static let configuration = CommandConfiguration(
++      abstract: "Export utilities.",
++      subcommands: [LoRA.self]
++    )
++
++    struct LoRA: DrawThingsCLICommand {
++      static let configuration = CommandConfiguration(
++        commandName: "lora",
++        abstract: "Export a trained LoRA checkpoint to a safetensors file.")
++
++      @OptionGroup var modelsDirectoryOptions: ModelsDirectoryOptions
++
++      @Option(name: [.short, .long], help: "LoRA checkpoint file name in the models directory.")
++      var file: String
++
++      @Option(name: [.short, .long], help: "Output .safetensors path.")
++      var output: String
++
++      mutating func run(context: DrawThingsCLIContext) throws {
++        let modelsDirectory = try ModelsDirectoryResolver.resolve(
++          context: context, path: modelsDirectoryOptions.modelsDir)
++        ModelZoo.externalUrls = [modelsDirectory]
++        context.print("Models directory: \(modelsDirectory.path)")
++        try LoRAExporter.export(file: file, outputFile: output) { progress, total in
++          if progress == total || progress % 200 == 0 {
++            context.print("export \(progress)/\(total)")
++          }
++        }
++      }
++    }
++  }
++
+   struct Completion: DrawThingsCLICommand {
+     static let configuration = CommandConfiguration(
+       abstract: "Generate shell completion scripts.",
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index 048ca3d..e973172 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -6026,6 +6026,13 @@ public struct LoRATrainer {
+     if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MPSGEMM"] != nil {
+       DynamicGraph.flags.insert(.disableMixedMPSGEMM)
+     }
++    if version == .sdxlBase {
++      print(
++        "[flags] MFA=on NAX=\(DynamicGraph.flags.contains(.disableMFANeuralAccelerators) ? "off" : "on") "
++          + "MFAGemm=\(DynamicGraph.flags.contains(.disableMFAGEMM) ? "off" : "on") "
++          + "MFAAttn=\(DynamicGraph.flags.contains(.disableMFAAttention) ? "off" : "on")"
++      )
++    }
+     graph.openStore(session, flags: .readOnly) { sessionStore in
+       if version == .flux1 {
+         trainFlux1(
+@@ -7102,6 +7109,7 @@ public struct LoRATrainer {
+         ProcessInfo.processInfo.environment["DRAWLORA_LOSS_SCALE"].flatMap { Float($0) } ?? 32_768
+       var scaler = GradScaler(scale: Float(initialLossScale))
+       var scalerSkipCount = 0
++      var consecutiveSkips = 0
+       var stopped = false
+       var batchCount = 0
+       let latentZeros: DynamicGraph.Tensor<FloatType>?
+@@ -7673,14 +7681,20 @@ public struct LoRATrainer {
+             } else {
+               let scaleBefore = scaler.scale
+               scaler.step(&optimizers)
+-              if scaler.scale < scaleBefore { scalerSkipCount += 1 }
++              if scaler.scale < scaleBefore {
++                scalerSkipCount += 1
++                consecutiveSkips += 1
++              } else {
++                consecutiveSkips = 0
++              }
+             }
+             if version == .sdxlBase {
+               let diagStep = optimizers.first.map { "\($0.step)" } ?? "none"
+               print(
+                 "[diag] step=\(i) optimizer.step=\(diagStep) scale=\(scaler.scale) skips=\(scalerSkipCount)"
+               )
+-              if scalerSkipCount >= 5 || scaler.scale < 1 {
++              let noFailFast = ProcessInfo.processInfo.environment["DRAWLORA_NO_FAILFAST"] != nil
++              if !noFailFast && (consecutiveSkips >= 8 || scaler.scale < 1) {
+                 print(
+                   "[fail-fast] aborting training: skips=\(scalerSkipCount) scale=\(scaler.scale) step=\(i)"
+                 )
+diff --git a/Package.resolved b/Package.resolved
+index e624c5b..86c2869 100644
+--- a/Package.resolved
++++ b/Package.resolved
+@@ -33,14 +33,6 @@
+         "version" : "1.27.6"
+       }
+     },
+-    {
+-      "identity" : "lottie-ios",
+-      "kind" : "remoteSourceControl",
+-      "location" : "https://github.com/airbnb/lottie-ios.git",
+-      "state" : {
+-        "revision" : "a004050748dc197c56256a14dca49a035d74726c"
+-      }
+-    },
+     {
+       "identity" : "s4nnc",
+       "kind" : "remoteSourceControl",
+@@ -253,22 +245,6 @@
+         "revision" : "48f1241971c19dc79c314e5a9c5b9c38cbf25a53"
+       }
+     },
+-    {
+-      "identity" : "swift-png",
+-      "kind" : "remoteSourceControl",
+-      "location" : "https://github.com/kelvin13/swift-png",
+-      "state" : {
+-        "revision" : "075dfb248ae327822635370e9d4f94a5d3fe93b2"
+-      }
+-    },
+-    {
+-      "identity" : "swift-protobuf",
+-      "kind" : "remoteSourceControl",
+-      "location" : "https://github.com/apple/swift-protobuf.git",
+-      "state" : {
+-        "revision" : "d57a5aecf24a25b32ec4a74be2f5d0a995a47c4b"
+-      }
+-    },
+     {
+       "identity" : "swift-sentencepiece",
+       "kind" : "remoteSourceControl",

@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:36:54 +0800
+Subject: [PATCH 1/4] SDXL LoRA: keep MFA but disable neural accelerators; add
+ training diagnostics
+
+- Trainer: force .disableMFANeuralAccelerators for SD/SDXL (M5 MFA attention
+  backward produces non-finite gradients via the NA path)
+- Trainer: DRAWLORA_LOSS_SCALE / DRAWLORA_GRAD_NAN / DRAWLORA_NO_SCALER hooks,
+  scaler skip counter, optimizer parameter count diagnostics
+- NNC: expose Parameters.gradientIsNaN for per-parameter gradient checks
+- Package.swift: vendor swift-png and swift-protobuf as path dependencies
+---
+ Libraries/Trainer/Sources/LoRATrainer.swift | 92 ++++++++++++++++++++-
+ Package.swift                               |  6 +-
+ Vendors/swift-png                           |  1 +
+ Vendors/swift-protobuf                      |  1 +
+ 4 files changed, 93 insertions(+), 7 deletions(-)
+ create mode 160000 Vendors/swift-png
+ create mode 160000 Vendors/swift-protobuf
+
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index 4000589..b4548a1 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -5991,6 +5991,40 @@ public struct LoRATrainer {
+         DynamicGraph.flags.remove(.disableMFAAppleNeuralEngineAndGpu)
+       }
+     }
++    // MFA backward produces non-finite gradients for the SD/SDXL trainer, which makes
++    // GradScaler skip every step. Force it off for these versions ("DRAWLORA_ENABLE_MFA=1" to opt back in).
++    // The MFA attention kernels produce non-finite gradients on M5 when they run through the
++    // neural-accelerator path, which makes GradScaler skip every step. Keep the MFA kernels and
++    // only turn off the neural-accelerator dispatch ("DRAWLORA_DISABLE_MFA=1" for the full opt-out).
++    if version == .sdxlBase || version == .sdxlRefiner || version == .ssd1b || version == .v1
++      || version == .v2
++    {
++      DynamicGraph.flags.insert(.disableMFANeuralAccelerators)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA"] != nil {
++      DynamicGraph.flags.insert(.disableMFA)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_ENABLE_MFA"] != nil {
++      DynamicGraph.flags.remove(.disableMFA)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_ATTN_SPECC"] != nil {
++      DynamicGraph.flags.insert(.disableMFAAttentionSpecializingC)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_GEMM_SPECM"] != nil {
++      DynamicGraph.flags.insert(.disableMFAGEMMSpecializingM)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_NAX"] != nil {
++      DynamicGraph.flags.insert(.disableMFANeuralAccelerators)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_ATTN"] != nil {
++      DynamicGraph.flags.insert(.disableMFAAttention)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_GEMM"] != nil {
++      DynamicGraph.flags.insert(.disableMFAGEMM)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MPSGEMM"] != nil {
++      DynamicGraph.flags.insert(.disableMixedMPSGEMM)
++    }
+     graph.openStore(session, flags: .readOnly) { sessionStore in
+       if version == .flux1 {
+         trainFlux1(
+@@ -6812,6 +6846,31 @@ public struct LoRATrainer {
+         }
+         store.read("unet", model: unet, codec: [.jit, .q6p, .q8p, .ezm7, .fpzip, externalData]) {
+           name, dataType, format, shape in
++          if let probeUp = ProcessInfo.processInfo.environment["DRAWLORA_PROBE_UP"].flatMap({
++            Float($0)
++          }), name.contains("lora_up")
++          {
++            switch dataType {
++            case .Float16, .BFloat16:
++              var tensor = Tensor<Float16>(.CPU, format: format, shape: shape)
++              tensor.withUnsafeMutableBytes {
++                let count = shape.reduce(1, *)
++                let p = $0.baseAddress!.bindMemory(to: Float16.self, capacity: count)
++                for i in 0..<count { p[i] = Float16(probeUp) }
++              }
++              return .final(tensor)
++            case .Float32:
++              var tensor = Tensor<Float32>(.CPU, format: format, shape: shape)
++              tensor.withUnsafeMutableBytes {
++                let count = shape.reduce(1, *)
++                let p = $0.baseAddress!.bindMemory(to: Float32.self, capacity: count)
++                for i in 0..<count { p[i] = probeUp }
++              }
++              return .final(tensor)
++            default:
++              break
++            }
++          }
+           if resumeIfPossible && (name.contains("[i-") || name.contains("lora")) {
+             if let resumingLoRAFile = resumingLoRAFile?.0, name.contains("lora") {
+               if let tensor = try?
+@@ -6890,8 +6949,15 @@ public struct LoRATrainer {
+         var unetOptimizer = AdamWOptimizer(
+           graph, rate: unetLearningRate.upperBound, betas: (0.9, 0.999), decay: 0.001, epsilon: 1e-8
+         )
+-        unetOptimizer.parameters = [unet.parameters]
++        unetOptimizer.parameters = unet.parameters.filter(where: { $0.contains("lora") })
+         optimizers.append(unetOptimizer)
++        if version == .sdxlBase {
++          let diagUp = unet.parameters.filter(where: { $0.contains("lora_up") }).count
++          let diagDown = unet.parameters.filter(where: { $0.contains("lora_down") }).count
++          print(
++            "[diag] unet.parameters.count=\(unet.parameters.count) lora_up=\(diagUp) lora_down=\(diagDown) bytes=\(unet.parameters.size)"
++          )
++        }
+       }
+       if cotrainTextModel {
+         var textModelOptimizer = AdamWOptimizer(
+@@ -7012,7 +7078,10 @@ public struct LoRATrainer {
+         ), objective: .epsilon)
+       let alphasCumprod = discretization.alphasCumprod
+       let minSNRGamma: Double = 1
+-      var scaler = GradScaler(scale: 32_768)
++      let initialLossScale =
++        ProcessInfo.processInfo.environment["DRAWLORA_LOSS_SCALE"].flatMap { Float($0) } ?? 32_768
++      var scaler = GradScaler(scale: Float(initialLossScale))
++      var scalerSkipCount = 0
+       var stopped = false
+       var batchCount = 0
+       let latentZeros: DynamicGraph.Tensor<FloatType>?
+@@ -7579,7 +7648,24 @@ public struct LoRATrainer {
+           }
+           if batchCount == gradientAccumulationSteps {
+             // Update the LoRA.
+-            scaler.step(&optimizers)
++            if ProcessInfo.processInfo.environment["DRAWLORA_NO_SCALER"] != nil {
++              optimizers.step()
++            } else {
++              let scaleBefore = scaler.scale
++              scaler.step(&optimizers)
++              if scaler.scale < scaleBefore { scalerSkipCount += 1 }
++            }
++            if version == .sdxlBase {
++              let diagStep = optimizers.first.map { "\($0.step)" } ?? "none"
++              print(
++                "[diag] step=\(i) optimizer.step=\(diagStep) scale=\(scaler.scale) skips=\(scalerSkipCount)"
++              )
++              if ProcessInfo.processInfo.environment["DRAWLORA_GRAD_NAN"] != nil {
++                let ups = unet.parameters.filter(where: { $0.contains("lora_up") })
++                let nans = ups.filter { $0.gradientIsNaN }
++                print("[diag] lora_up total=\(ups.count) nan_grad=\(nans.count) sample=\(nans.prefix(3).map { $0.name })")
++              }
++            }
+             batchCount = 0
+             if let gammas = gammas, let optimizer = optimizers.first {  // If we need to compute ema.
+               let betaLowerBound = Float(
+diff --git a/Package.swift b/Package.swift
+index bc36c53..cfda237 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -43,13 +43,11 @@ let package = Package(
+     // Before 1.20, grpc-swift left the HTTP/2 connection window at 64 KB with swift-nio-http2 1.42.0
+     // and later. 1.27 matches the Bazel pin.
+     .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.27.0"),
+-    .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.27.0"),
++    .package(name: "swift-protobuf", path: "Vendors/swift-protobuf"),
+     .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.3"),
+     .package(url: "https://github.com/apple/swift-algorithms.git", from: "1.1.0"),
+     .package(url: "https://github.com/apple/swift-numerics.git", from: "1.0.0"),
+-    .package(
+-      url: "https://github.com/kelvin13/swift-png",
+-      revision: "075dfb248ae327822635370e9d4f94a5d3fe93b2"),
++    .package(name: "swift-png", path: "Vendors/swift-png"),
+     .package(name: "SwiftSoup", path: "Vendors/SwiftSoup"),
+     .package(
+       url: "https://github.com/jpsim/Yams.git",
+diff --git a/Vendors/swift-png b/Vendors/swift-png
+new file mode 160000
+index 0000000..075dfb2
+--- /dev/null
++++ b/Vendors/swift-png
+@@ -0,0 +1 @@
++Subproject commit 075dfb248ae327822635370e9d4f94a5d3fe93b2
+diff --git a/Vendors/swift-protobuf b/Vendors/swift-protobuf
+new file mode 160000
+index 0000000..d57a5ae
+--- /dev/null
++++ b/Vendors/swift-protobuf
+@@ -0,0 +1 @@
++Subproject commit d57a5aecf24a25b32ec4a74be2f5d0a995a47c4b

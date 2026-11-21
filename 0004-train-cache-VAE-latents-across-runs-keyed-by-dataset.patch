@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 21:52:04 +0800
+Subject: [PATCH 4/4] train: cache VAE latents across runs keyed by dataset
+ contents
+
+---
+ Libraries/Trainer/Sources/LoRATrainer.swift | 94 +++++++++++++++++++--
+ 1 file changed, 85 insertions(+), 9 deletions(-)
+
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index e973172..7c929ab 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -2247,6 +2247,56 @@ public struct LoRATrainer {
+       originalSize: (0, 0), cropTopLeft: (0, 0),
+       targetSize: (0, 0), loadedImagePath: "")
+     var stopped = false
++    // Persist VAE latents across runs, keyed by dataset contents and encoding settings.
++    let useDatasetCache = ProcessInfo.processInfo.environment["DRAWLORA_NO_DATASET_CACHE"] == nil
++    var cachedLatents = [String: Tensor<FloatType>]()
++    var newLatents = [String: Tensor<FloatType>]()
++    var datasetCachePath: String? = nil
++    func latentCacheKey(_ input: Input, _ imageWidth: Int, _ imageHeight: Int) -> String {
++      return "\(input.imageUrl.path)|\(imageWidth)x\(imageHeight)"
++    }
++    if useDatasetCache {
++      var signature = ""
++      for input in inputs {
++        let attributes = try? FileManager.default.attributesOfItem(atPath: input.imageUrl.path)
++        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
++        let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
++        signature += "\(input.imageUrl.path)|\(size)|\(modified)|\(input.caption)\n"
++      }
++      signature +=
++        "\(version)|\(autoencoder)|\(scale.widthScale)x\(scale.heightScale)|\(useImageAspectRatio)|\(customEmbeddingLength)"
++      let hash = stableLoRACacheHash(signature)
++      if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
++        let cacheDirectory = caches.appendingPathComponent("DrawThingsLoRA", isDirectory: true)
++        try? FileManager.default.createDirectory(
++          at: cacheDirectory, withIntermediateDirectories: true)
++        let cachePath = cacheDirectory.appendingPathComponent("latents-\(hash).store").path
++        datasetCachePath = cachePath
++        if FileManager.default.fileExists(atPath: cachePath) {
++          graph.openStore(cachePath, flags: [.readOnly]) { cacheStore in
++            for input in inputs {
++              guard let originalSize = imageInspector(input.imageUrl),
++                originalSize.width > 0 && originalSize.height > 0
++              else { continue }
++              let imageWidth: Int
++              let imageHeight: Int
++              if useImageAspectRatio {
++                let imageSize = Self.sizeThatFits(size: originalSize, scale: scale)
++                imageWidth = imageSize.width * 64
++                imageHeight = imageSize.height * 64
++              } else {
++                imageWidth = Int(scale.widthScale) * 64
++                imageHeight = Int(scale.heightScale) * 64
++              }
++              let key = latentCacheKey(input, imageWidth, imageHeight)
++              if let tensor = cacheStore.read(key) as? Tensor<FloatType> {
++                cachedLatents[key] = tensor
++              }
++            }
++          }
++        }
++      }
++    }
+     graph.openStore(session) { store in
+       // First, center crop and encode the image.
+       graph.withNoGrad {
+@@ -2271,16 +2321,26 @@ public struct LoRATrainer {
+             let (tensor, originalSize, cropTopLeft, targetSize) = imageLoader(
+               input.imageUrl, imageWidth, imageHeight)
+           else { continue }
+-          if previousImageWidth != imageWidth || previousImageHeight != imageHeight {
+-            encoder = nil  // Reload encoder.
+-          }
+-          // Keep this in the database.
+-          let tuple = firstStage.encode(
+-            graph.constant(tensor.toGPU(0)), encoder: encoder, cancellation: { _ in })
+-          let sample = tuple.0.rawValue.toCPU()
+-          encoder = tuple.1
+           let imagePath = input.imageUrl.path
+-          store.write(imagePath, tensor: sample)
++          let cacheKey = latentCacheKey(input, imageWidth, imageHeight)
++          if let cachedSample = cachedLatents[cacheKey] {
++            store.write(imagePath, tensor: cachedSample)
++          } else {
++            if previousImageWidth != imageWidth || previousImageHeight != imageHeight {
++              encoder = nil  // Reload encoder.
++            }
++            // Keep this in the database.
++            let tuple = firstStage.encode(
++              graph.constant(tensor.toGPU(0)), encoder: encoder, cancellation: { _ in })
++            let sample = tuple.0.rawValue.toCPU()
++            encoder = tuple.1
++            store.write(imagePath, tensor: sample)
++            if useDatasetCache {
++              newLatents[cacheKey] = sample
++            }
++          }
++          previousImageWidth = imageWidth
++          previousImageHeight = imageHeight
+           let (_, tokens, _, _, _) = tokenizer.tokenize(
+             text: input.caption, truncation: truncation, maxLength: tokenMaxLength)
+           var updatedTokens = [Int32]()
+@@ -2391,6 +2451,13 @@ public struct LoRATrainer {
+     if stopped {
+       return nil
+     }
++    if useDatasetCache, !newLatents.isEmpty, let cachePath = datasetCachePath {
++      graph.openStore(cachePath, flags: []) { cacheStore in
++        for (key, tensor) in newLatents {
++          cacheStore.write(key, tensor: tensor)
++        }
++      }
++    }
+     var dataFrame = DataFrame(from: processedInputs)
+     dataFrame["imagePath"] = dataFrame["0", ProcessedInput.self].map(\.imagePath)
+     dataFrame["tokens"] = dataFrame["0", ProcessedInput.self].map(\.tokens)
+@@ -7887,3 +7954,12 @@ public struct LoRATrainer {
+     }
+   }
+ }
++
++private func stableLoRACacheHash(_ string: String) -> String {
++  var hash: UInt64 = 0xcbf2_9ce4_8422_2325
++  for byte in string.utf8 {
++    hash ^= UInt64(byte)
++    hash = hash &* 0x0000_0100_0000_01b3
++  }
++  return String(hash, radix: 16)
++}

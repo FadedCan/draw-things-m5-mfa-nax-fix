@@ -1,0 +1,104 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:08:01 +0800
+Subject: [PATCH 2/4] diag: per-parameter NaN dump, attention-level hook,
+ ENABLE_MFA clears NAX
+
+- DRAWLORA_GRAD_NAN_ALL prints name+isnan for every lora_up parameter
+- DRAWLORA_ATTN_LEVEL selects none/scale1/quantized for the SDXL builder
+- DRAWLORA_ENABLE_MFA now also clears .disableMFANeuralAccelerators (it previously
+  only cleared .disableMFA, which made 'NAX on' runs silently run with NAX off)
+---
+ Libraries/Trainer/Sources/LoRATrainer.swift | 42 +++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index b4548a1..048ca3d 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -6006,6 +6006,7 @@ public struct LoRATrainer {
+     }
+     if ProcessInfo.processInfo.environment["DRAWLORA_ENABLE_MFA"] != nil {
+       DynamicGraph.flags.remove(.disableMFA)
++      DynamicGraph.flags.remove(.disableMFANeuralAccelerators)
+     }
+     if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_ATTN_SPECC"] != nil {
+       DynamicGraph.flags.insert(.disableMFAAttentionSpecializingC)
+@@ -6311,12 +6312,20 @@ public struct LoRATrainer {
+         if !cotrainUNet {
+           configuration.rank = 0
+         }
++        let attentionLevel: FlashAttentionLevel = {
++          switch ProcessInfo.processInfo.environment["DRAWLORA_ATTN_LEVEL"] {
++          case "none": return .none
++          case "scale1": return .scale1
++          case "quantized": return .quantized
++          default: return isMFAEnabled ? .scaleMerged : .none
++          }
++        }()
+         unetFixed = LoRAUNetXLFixed(
+           batchSize: 1, startHeight: latentsHeight, startWidth: latentsWidth,
+           channels: [320, 640, 1280], embeddingLength: (tokenLength, tokenLength),
+           inputAttentionRes: [2: [2, 2], 4: [10, 10]], middleAttentionBlocks: 10,
+           outputAttentionRes: [2: [2, 2, 2], 4: [10, 10, 10]],
+-          usesFlashAttention: isMFAEnabled ? .scaleMerged : .none, LoRAConfiguration: configuration)
++          usesFlashAttention: attentionLevel, LoRAConfiguration: configuration)
+         unet = ModelBuilder { size, _ in
+           return LoRAUNetXL(
+             batchSize: 1, startHeight: size.height, startWidth: size.width,
+@@ -6324,7 +6333,7 @@ public struct LoRATrainer {
+             middleAttentionBlocks: 10, outputAttentionRes: [2: [2, 2, 2], 4: [10, 10, 10]],
+             embeddingLength: (tokenLength, tokenLength), injectIPAdapterLengths: [],
+             upcastAttention: ([:], false, [:]),
+-            usesFlashAttention: isMFAEnabled ? .scaleMerged : .none,
++            usesFlashAttention: attentionLevel,
+             injectControls: false, LoRAConfiguration: configuration
+           ).0
+         }
+@@ -6949,7 +6958,18 @@ public struct LoRATrainer {
+         var unetOptimizer = AdamWOptimizer(
+           graph, rate: unetLearningRate.upperBound, betas: (0.9, 0.999), decay: 0.001, epsilon: 1e-8
+         )
+-        unetOptimizer.parameters = unet.parameters.filter(where: { $0.contains("lora") })
++        var trainableParameters = unet.parameters.filter(where: { $0.contains("lora") })
++        // The SDXL fixed encoder owns every cross-attention to_k / to_v LoRA pair (140 of them)
++        // and is normally left out of the optimizer, so those projections stay at their zero
++        // initialisation. Opt in with DRAWLORA_TRAIN_FIXED=1 to train them together with the UNet.
++        if ProcessInfo.processInfo.environment["DRAWLORA_TRAIN_FIXED"] != nil,
++          let unetFixed = unetFixed
++        {
++          let fixedParameters = unetFixed.parameters.filter(where: { $0.contains("lora") })
++          print("[diag] fixed encoder lora parameters=\(fixedParameters.count)")
++          trainableParameters += fixedParameters
++        }
++        unetOptimizer.parameters = trainableParameters
+         optimizers.append(unetOptimizer)
+         if version == .sdxlBase {
+           let diagUp = unet.parameters.filter(where: { $0.contains("lora_up") }).count
+@@ -7660,10 +7680,26 @@ public struct LoRATrainer {
+               print(
+                 "[diag] step=\(i) optimizer.step=\(diagStep) scale=\(scaler.scale) skips=\(scalerSkipCount)"
+               )
++              if scalerSkipCount >= 5 || scaler.scale < 1 {
++                print(
++                  "[fail-fast] aborting training: skips=\(scalerSkipCount) scale=\(scaler.scale) step=\(i)"
++                )
++                stopped = true
++              }
+               if ProcessInfo.processInfo.environment["DRAWLORA_GRAD_NAN"] != nil {
+                 let ups = unet.parameters.filter(where: { $0.contains("lora_up") })
+                 let nans = ups.filter { $0.gradientIsNaN }
+                 print("[diag] lora_up total=\(ups.count) nan_grad=\(nans.count) sample=\(nans.prefix(3).map { $0.name })")
++                if let unetFixed = unetFixed {
++                  let fixedUps = unetFixed.parameters.filter(where: { $0.contains("lora_up") })
++                  let fixedNans = fixedUps.filter { $0.gradientIsNaN }
++                  print("[diag] fixed lora_up total=\(fixedUps.count) nan_grad=\(fixedNans.count)")
++                }
++                if ProcessInfo.processInfo.environment["DRAWLORA_GRAD_NAN_ALL"] != nil, i < 4 {
++                  for up in ups {
++                    print("[nanmap] \(up.name) \(up.gradientIsNaN ? 1 : 0)")
++                  }
++                }
+               }
+             }
+             batchCount = 0
