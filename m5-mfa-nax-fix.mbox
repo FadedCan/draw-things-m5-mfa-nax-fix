@@ -1,0 +1,580 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 22:36:54 +0800
+Subject: [PATCH 1/4] SDXL LoRA: keep MFA but disable neural accelerators; add
+ training diagnostics
+
+- Trainer: force .disableMFANeuralAccelerators for SD/SDXL (M5 MFA attention
+  backward produces non-finite gradients via the NA path)
+- Trainer: DRAWLORA_LOSS_SCALE / DRAWLORA_GRAD_NAN / DRAWLORA_NO_SCALER hooks,
+  scaler skip counter, optimizer parameter count diagnostics
+- NNC: expose Parameters.gradientIsNaN for per-parameter gradient checks
+- Package.swift: vendor swift-png and swift-protobuf as path dependencies
+---
+ Libraries/Trainer/Sources/LoRATrainer.swift | 92 ++++++++++++++++++++-
+ Package.swift                               |  6 +-
+ Vendors/swift-png                           |  1 +
+ Vendors/swift-protobuf                      |  1 +
+ 4 files changed, 93 insertions(+), 7 deletions(-)
+ create mode 160000 Vendors/swift-png
+ create mode 160000 Vendors/swift-protobuf
+
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index 4000589..b4548a1 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -5991,6 +5991,40 @@ public struct LoRATrainer {
+         DynamicGraph.flags.remove(.disableMFAAppleNeuralEngineAndGpu)
+       }
+     }
++    // MFA backward produces non-finite gradients for the SD/SDXL trainer, which makes
++    // GradScaler skip every step. Force it off for these versions ("DRAWLORA_ENABLE_MFA=1" to opt back in).
++    // The MFA attention kernels produce non-finite gradients on M5 when they run through the
++    // neural-accelerator path, which makes GradScaler skip every step. Keep the MFA kernels and
++    // only turn off the neural-accelerator dispatch ("DRAWLORA_DISABLE_MFA=1" for the full opt-out).
++    if version == .sdxlBase || version == .sdxlRefiner || version == .ssd1b || version == .v1
++      || version == .v2
++    {
++      DynamicGraph.flags.insert(.disableMFANeuralAccelerators)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA"] != nil {
++      DynamicGraph.flags.insert(.disableMFA)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_ENABLE_MFA"] != nil {
++      DynamicGraph.flags.remove(.disableMFA)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_ATTN_SPECC"] != nil {
++      DynamicGraph.flags.insert(.disableMFAAttentionSpecializingC)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_GEMM_SPECM"] != nil {
++      DynamicGraph.flags.insert(.disableMFAGEMMSpecializingM)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_NAX"] != nil {
++      DynamicGraph.flags.insert(.disableMFANeuralAccelerators)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_ATTN"] != nil {
++      DynamicGraph.flags.insert(.disableMFAAttention)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_GEMM"] != nil {
++      DynamicGraph.flags.insert(.disableMFAGEMM)
++    }
++    if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MPSGEMM"] != nil {
++      DynamicGraph.flags.insert(.disableMixedMPSGEMM)
++    }
+     graph.openStore(session, flags: .readOnly) { sessionStore in
+       if version == .flux1 {
+         trainFlux1(
+@@ -6812,6 +6846,31 @@ public struct LoRATrainer {
+         }
+         store.read("unet", model: unet, codec: [.jit, .q6p, .q8p, .ezm7, .fpzip, externalData]) {
+           name, dataType, format, shape in
++          if let probeUp = ProcessInfo.processInfo.environment["DRAWLORA_PROBE_UP"].flatMap({
++            Float($0)
++          }), name.contains("lora_up")
++          {
++            switch dataType {
++            case .Float16, .BFloat16:
++              var tensor = Tensor<Float16>(.CPU, format: format, shape: shape)
++              tensor.withUnsafeMutableBytes {
++                let count = shape.reduce(1, *)
++                let p = $0.baseAddress!.bindMemory(to: Float16.self, capacity: count)
++                for i in 0..<count { p[i] = Float16(probeUp) }
++              }
++              return .final(tensor)
++            case .Float32:
++              var tensor = Tensor<Float32>(.CPU, format: format, shape: shape)
++              tensor.withUnsafeMutableBytes {
++                let count = shape.reduce(1, *)
++                let p = $0.baseAddress!.bindMemory(to: Float32.self, capacity: count)
++                for i in 0..<count { p[i] = probeUp }
++              }
++              return .final(tensor)
++            default:
++              break
++            }
++          }
+           if resumeIfPossible && (name.contains("[i-") || name.contains("lora")) {
+             if let resumingLoRAFile = resumingLoRAFile?.0, name.contains("lora") {
+               if let tensor = try?
+@@ -6890,8 +6949,15 @@ public struct LoRATrainer {
+         var unetOptimizer = AdamWOptimizer(
+           graph, rate: unetLearningRate.upperBound, betas: (0.9, 0.999), decay: 0.001, epsilon: 1e-8
+         )
+-        unetOptimizer.parameters = [unet.parameters]
++        unetOptimizer.parameters = unet.parameters.filter(where: { $0.contains("lora") })
+         optimizers.append(unetOptimizer)
++        if version == .sdxlBase {
++          let diagUp = unet.parameters.filter(where: { $0.contains("lora_up") }).count
++          let diagDown = unet.parameters.filter(where: { $0.contains("lora_down") }).count
++          print(
++            "[diag] unet.parameters.count=\(unet.parameters.count) lora_up=\(diagUp) lora_down=\(diagDown) bytes=\(unet.parameters.size)"
++          )
++        }
+       }
+       if cotrainTextModel {
+         var textModelOptimizer = AdamWOptimizer(
+@@ -7012,7 +7078,10 @@ public struct LoRATrainer {
+         ), objective: .epsilon)
+       let alphasCumprod = discretization.alphasCumprod
+       let minSNRGamma: Double = 1
+-      var scaler = GradScaler(scale: 32_768)
++      let initialLossScale =
++        ProcessInfo.processInfo.environment["DRAWLORA_LOSS_SCALE"].flatMap { Float($0) } ?? 32_768
++      var scaler = GradScaler(scale: Float(initialLossScale))
++      var scalerSkipCount = 0
+       var stopped = false
+       var batchCount = 0
+       let latentZeros: DynamicGraph.Tensor<FloatType>?
+@@ -7579,7 +7648,24 @@ public struct LoRATrainer {
+           }
+           if batchCount == gradientAccumulationSteps {
+             // Update the LoRA.
+-            scaler.step(&optimizers)
++            if ProcessInfo.processInfo.environment["DRAWLORA_NO_SCALER"] != nil {
++              optimizers.step()
++            } else {
++              let scaleBefore = scaler.scale
++              scaler.step(&optimizers)
++              if scaler.scale < scaleBefore { scalerSkipCount += 1 }
++            }
++            if version == .sdxlBase {
++              let diagStep = optimizers.first.map { "\($0.step)" } ?? "none"
++              print(
++                "[diag] step=\(i) optimizer.step=\(diagStep) scale=\(scaler.scale) skips=\(scalerSkipCount)"
++              )
++              if ProcessInfo.processInfo.environment["DRAWLORA_GRAD_NAN"] != nil {
++                let ups = unet.parameters.filter(where: { $0.contains("lora_up") })
++                let nans = ups.filter { $0.gradientIsNaN }
++                print("[diag] lora_up total=\(ups.count) nan_grad=\(nans.count) sample=\(nans.prefix(3).map { $0.name })")
++              }
++            }
+             batchCount = 0
+             if let gammas = gammas, let optimizer = optimizers.first {  // If we need to compute ema.
+               let betaLowerBound = Float(
+diff --git a/Package.swift b/Package.swift
+index bc36c53..cfda237 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -43,13 +43,11 @@ let package = Package(
+     // Before 1.20, grpc-swift left the HTTP/2 connection window at 64 KB with swift-nio-http2 1.42.0
+     // and later. 1.27 matches the Bazel pin.
+     .package(url: "https://github.com/grpc/grpc-swift.git", from: "1.27.0"),
+-    .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.27.0"),
++    .package(name: "swift-protobuf", path: "Vendors/swift-protobuf"),
+     .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.3"),
+     .package(url: "https://github.com/apple/swift-algorithms.git", from: "1.1.0"),
+     .package(url: "https://github.com/apple/swift-numerics.git", from: "1.0.0"),
+-    .package(
+-      url: "https://github.com/kelvin13/swift-png",
+-      revision: "075dfb248ae327822635370e9d4f94a5d3fe93b2"),
++    .package(name: "swift-png", path: "Vendors/swift-png"),
+     .package(name: "SwiftSoup", path: "Vendors/SwiftSoup"),
+     .package(
+       url: "https://github.com/jpsim/Yams.git",
+diff --git a/Vendors/swift-png b/Vendors/swift-png
+new file mode 160000
+index 0000000..075dfb2
+--- /dev/null
++++ b/Vendors/swift-png
+@@ -0,0 +1 @@
++Subproject commit 075dfb248ae327822635370e9d4f94a5d3fe93b2
+diff --git a/Vendors/swift-protobuf b/Vendors/swift-protobuf
+new file mode 160000
+index 0000000..d57a5ae
+--- /dev/null
++++ b/Vendors/swift-protobuf
+@@ -0,0 +1 @@
++Subproject commit d57a5aecf24a25b32ec4a74be2f5d0a995a47c4b
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 20:08:01 +0800
+Subject: [PATCH 2/4] diag: per-parameter NaN dump, attention-level hook,
+ ENABLE_MFA clears NAX
+
+- DRAWLORA_GRAD_NAN_ALL prints name+isnan for every lora_up parameter
+- DRAWLORA_ATTN_LEVEL selects none/scale1/quantized for the SDXL builder
+- DRAWLORA_ENABLE_MFA now also clears .disableMFANeuralAccelerators (it previously
+  only cleared .disableMFA, which made 'NAX on' runs silently run with NAX off)
+---
+ Libraries/Trainer/Sources/LoRATrainer.swift | 42 +++++++++++++++++++--
+ 1 file changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index b4548a1..048ca3d 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -6006,6 +6006,7 @@ public struct LoRATrainer {
+     }
+     if ProcessInfo.processInfo.environment["DRAWLORA_ENABLE_MFA"] != nil {
+       DynamicGraph.flags.remove(.disableMFA)
++      DynamicGraph.flags.remove(.disableMFANeuralAccelerators)
+     }
+     if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MFA_ATTN_SPECC"] != nil {
+       DynamicGraph.flags.insert(.disableMFAAttentionSpecializingC)
+@@ -6311,12 +6312,20 @@ public struct LoRATrainer {
+         if !cotrainUNet {
+           configuration.rank = 0
+         }
++        let attentionLevel: FlashAttentionLevel = {
++          switch ProcessInfo.processInfo.environment["DRAWLORA_ATTN_LEVEL"] {
++          case "none": return .none
++          case "scale1": return .scale1
++          case "quantized": return .quantized
++          default: return isMFAEnabled ? .scaleMerged : .none
++          }
++        }()
+         unetFixed = LoRAUNetXLFixed(
+           batchSize: 1, startHeight: latentsHeight, startWidth: latentsWidth,
+           channels: [320, 640, 1280], embeddingLength: (tokenLength, tokenLength),
+           inputAttentionRes: [2: [2, 2], 4: [10, 10]], middleAttentionBlocks: 10,
+           outputAttentionRes: [2: [2, 2, 2], 4: [10, 10, 10]],
+-          usesFlashAttention: isMFAEnabled ? .scaleMerged : .none, LoRAConfiguration: configuration)
++          usesFlashAttention: attentionLevel, LoRAConfiguration: configuration)
+         unet = ModelBuilder { size, _ in
+           return LoRAUNetXL(
+             batchSize: 1, startHeight: size.height, startWidth: size.width,
+@@ -6324,7 +6333,7 @@ public struct LoRATrainer {
+             middleAttentionBlocks: 10, outputAttentionRes: [2: [2, 2, 2], 4: [10, 10, 10]],
+             embeddingLength: (tokenLength, tokenLength), injectIPAdapterLengths: [],
+             upcastAttention: ([:], false, [:]),
+-            usesFlashAttention: isMFAEnabled ? .scaleMerged : .none,
++            usesFlashAttention: attentionLevel,
+             injectControls: false, LoRAConfiguration: configuration
+           ).0
+         }
+@@ -6949,7 +6958,18 @@ public struct LoRATrainer {
+         var unetOptimizer = AdamWOptimizer(
+           graph, rate: unetLearningRate.upperBound, betas: (0.9, 0.999), decay: 0.001, epsilon: 1e-8
+         )
+-        unetOptimizer.parameters = unet.parameters.filter(where: { $0.contains("lora") })
++        var trainableParameters = unet.parameters.filter(where: { $0.contains("lora") })
++        // The SDXL fixed encoder owns every cross-attention to_k / to_v LoRA pair (140 of them)
++        // and is normally left out of the optimizer, so those projections stay at their zero
++        // initialisation. Opt in with DRAWLORA_TRAIN_FIXED=1 to train them together with the UNet.
++        if ProcessInfo.processInfo.environment["DRAWLORA_TRAIN_FIXED"] != nil,
++          let unetFixed = unetFixed
++        {
++          let fixedParameters = unetFixed.parameters.filter(where: { $0.contains("lora") })
++          print("[diag] fixed encoder lora parameters=\(fixedParameters.count)")
++          trainableParameters += fixedParameters
++        }
++        unetOptimizer.parameters = trainableParameters
+         optimizers.append(unetOptimizer)
+         if version == .sdxlBase {
+           let diagUp = unet.parameters.filter(where: { $0.contains("lora_up") }).count
+@@ -7660,10 +7680,26 @@ public struct LoRATrainer {
+               print(
+                 "[diag] step=\(i) optimizer.step=\(diagStep) scale=\(scaler.scale) skips=\(scalerSkipCount)"
+               )
++              if scalerSkipCount >= 5 || scaler.scale < 1 {
++                print(
++                  "[fail-fast] aborting training: skips=\(scalerSkipCount) scale=\(scaler.scale) step=\(i)"
++                )
++                stopped = true
++              }
+               if ProcessInfo.processInfo.environment["DRAWLORA_GRAD_NAN"] != nil {
+                 let ups = unet.parameters.filter(where: { $0.contains("lora_up") })
+                 let nans = ups.filter { $0.gradientIsNaN }
+                 print("[diag] lora_up total=\(ups.count) nan_grad=\(nans.count) sample=\(nans.prefix(3).map { $0.name })")
++                if let unetFixed = unetFixed {
++                  let fixedUps = unetFixed.parameters.filter(where: { $0.contains("lora_up") })
++                  let fixedNans = fixedUps.filter { $0.gradientIsNaN }
++                  print("[diag] fixed lora_up total=\(fixedUps.count) nan_grad=\(fixedNans.count)")
++                }
++                if ProcessInfo.processInfo.environment["DRAWLORA_GRAD_NAN_ALL"] != nil, i < 4 {
++                  for up in ups {
++                    print("[nanmap] \(up.name) \(up.gradientIsNaN ? 1 : 0)")
++                  }
++                }
+               }
+             }
+             batchCount = 0
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 19:31:06 +0800
+Subject: [PATCH 3/4] wip: diagnostics and CLI export before NAX optimization
+
+---
+ Apps/DrawThingsCLI/DrawThingsCLI.swift      | 35 ++++++++++++++++++++-
+ Libraries/Trainer/Sources/LoRATrainer.swift | 18 +++++++++--
+ Package.resolved                            | 24 --------------
+ 3 files changed, 50 insertions(+), 27 deletions(-)
+
+diff --git a/Apps/DrawThingsCLI/DrawThingsCLI.swift b/Apps/DrawThingsCLI/DrawThingsCLI.swift
+index d5989e9..4389b44 100644
+--- a/Apps/DrawThingsCLI/DrawThingsCLI.swift
++++ b/Apps/DrawThingsCLI/DrawThingsCLI.swift
+@@ -4194,7 +4194,7 @@ public struct DrawThingsCLI: ParsableCommand {
+     abstract: "Local inference and training CLI for Draw Things models.",
+     discussion: CLIHelpText.root,
+     version: CLIIdentity.version,
+-    subcommands: [Generate.self, Auth.self, Models.self, Train.self, Completion.self]
++    subcommands: [Generate.self, Auth.self, Models.self, Train.self, Export.self, Completion.self]
+   )
+ 
+   private static let invocationCondition = NSCondition()
+@@ -5218,6 +5218,39 @@ extension DrawThingsCLI {
+     }
+   }
+ 
++  struct Export: ParsableCommand {
++    static let configuration = CommandConfiguration(
++      abstract: "Export utilities.",
++      subcommands: [LoRA.self]
++    )
++
++    struct LoRA: DrawThingsCLICommand {
++      static let configuration = CommandConfiguration(
++        commandName: "lora",
++        abstract: "Export a trained LoRA checkpoint to a safetensors file.")
++
++      @OptionGroup var modelsDirectoryOptions: ModelsDirectoryOptions
++
++      @Option(name: [.short, .long], help: "LoRA checkpoint file name in the models directory.")
++      var file: String
++
++      @Option(name: [.short, .long], help: "Output .safetensors path.")
++      var output: String
++
++      mutating func run(context: DrawThingsCLIContext) throws {
++        let modelsDirectory = try ModelsDirectoryResolver.resolve(
++          context: context, path: modelsDirectoryOptions.modelsDir)
++        ModelZoo.externalUrls = [modelsDirectory]
++        context.print("Models directory: \(modelsDirectory.path)")
++        try LoRAExporter.export(file: file, outputFile: output) { progress, total in
++          if progress == total || progress % 200 == 0 {
++            context.print("export \(progress)/\(total)")
++          }
++        }
++      }
++    }
++  }
++
+   struct Completion: DrawThingsCLICommand {
+     static let configuration = CommandConfiguration(
+       abstract: "Generate shell completion scripts.",
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index 048ca3d..e973172 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -6026,6 +6026,13 @@ public struct LoRATrainer {
+     if ProcessInfo.processInfo.environment["DRAWLORA_DISABLE_MPSGEMM"] != nil {
+       DynamicGraph.flags.insert(.disableMixedMPSGEMM)
+     }
++    if version == .sdxlBase {
++      print(
++        "[flags] MFA=on NAX=\(DynamicGraph.flags.contains(.disableMFANeuralAccelerators) ? "off" : "on") "
++          + "MFAGemm=\(DynamicGraph.flags.contains(.disableMFAGEMM) ? "off" : "on") "
++          + "MFAAttn=\(DynamicGraph.flags.contains(.disableMFAAttention) ? "off" : "on")"
++      )
++    }
+     graph.openStore(session, flags: .readOnly) { sessionStore in
+       if version == .flux1 {
+         trainFlux1(
+@@ -7102,6 +7109,7 @@ public struct LoRATrainer {
+         ProcessInfo.processInfo.environment["DRAWLORA_LOSS_SCALE"].flatMap { Float($0) } ?? 32_768
+       var scaler = GradScaler(scale: Float(initialLossScale))
+       var scalerSkipCount = 0
++      var consecutiveSkips = 0
+       var stopped = false
+       var batchCount = 0
+       let latentZeros: DynamicGraph.Tensor<FloatType>?
+@@ -7673,14 +7681,20 @@ public struct LoRATrainer {
+             } else {
+               let scaleBefore = scaler.scale
+               scaler.step(&optimizers)
+-              if scaler.scale < scaleBefore { scalerSkipCount += 1 }
++              if scaler.scale < scaleBefore {
++                scalerSkipCount += 1
++                consecutiveSkips += 1
++              } else {
++                consecutiveSkips = 0
++              }
+             }
+             if version == .sdxlBase {
+               let diagStep = optimizers.first.map { "\($0.step)" } ?? "none"
+               print(
+                 "[diag] step=\(i) optimizer.step=\(diagStep) scale=\(scaler.scale) skips=\(scalerSkipCount)"
+               )
+-              if scalerSkipCount >= 5 || scaler.scale < 1 {
++              let noFailFast = ProcessInfo.processInfo.environment["DRAWLORA_NO_FAILFAST"] != nil
++              if !noFailFast && (consecutiveSkips >= 8 || scaler.scale < 1) {
+                 print(
+                   "[fail-fast] aborting training: skips=\(scalerSkipCount) scale=\(scaler.scale) step=\(i)"
+                 )
+diff --git a/Package.resolved b/Package.resolved
+index e624c5b..86c2869 100644
+--- a/Package.resolved
++++ b/Package.resolved
+@@ -33,14 +33,6 @@
+         "version" : "1.27.6"
+       }
+     },
+-    {
+-      "identity" : "lottie-ios",
+-      "kind" : "remoteSourceControl",
+-      "location" : "https://github.com/airbnb/lottie-ios.git",
+-      "state" : {
+-        "revision" : "a004050748dc197c56256a14dca49a035d74726c"
+-      }
+-    },
+     {
+       "identity" : "s4nnc",
+       "kind" : "remoteSourceControl",
+@@ -253,22 +245,6 @@
+         "revision" : "48f1241971c19dc79c314e5a9c5b9c38cbf25a53"
+       }
+     },
+-    {
+-      "identity" : "swift-png",
+-      "kind" : "remoteSourceControl",
+-      "location" : "https://github.com/kelvin13/swift-png",
+-      "state" : {
+-        "revision" : "075dfb248ae327822635370e9d4f94a5d3fe93b2"
+-      }
+-    },
+-    {
+-      "identity" : "swift-protobuf",
+-      "kind" : "remoteSourceControl",
+-      "location" : "https://github.com/apple/swift-protobuf.git",
+-      "state" : {
+-        "revision" : "d57a5aecf24a25b32ec4a74be2f5d0a995a47c4b"
+-      }
+-    },
+     {
+       "identity" : "swift-sentencepiece",
+       "kind" : "remoteSourceControl",
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: FadedCan <FadedCan@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 21:52:04 +0800
+Subject: [PATCH 4/4] train: cache VAE latents across runs keyed by dataset
+ contents
+
+---
+ Libraries/Trainer/Sources/LoRATrainer.swift | 94 +++++++++++++++++++--
+ 1 file changed, 85 insertions(+), 9 deletions(-)
+
+diff --git a/Libraries/Trainer/Sources/LoRATrainer.swift b/Libraries/Trainer/Sources/LoRATrainer.swift
+index e973172..7c929ab 100644
+--- a/Libraries/Trainer/Sources/LoRATrainer.swift
++++ b/Libraries/Trainer/Sources/LoRATrainer.swift
+@@ -2247,6 +2247,56 @@ public struct LoRATrainer {
+       originalSize: (0, 0), cropTopLeft: (0, 0),
+       targetSize: (0, 0), loadedImagePath: "")
+     var stopped = false
++    // Persist VAE latents across runs, keyed by dataset contents and encoding settings.
++    let useDatasetCache = ProcessInfo.processInfo.environment["DRAWLORA_NO_DATASET_CACHE"] == nil
++    var cachedLatents = [String: Tensor<FloatType>]()
++    var newLatents = [String: Tensor<FloatType>]()
++    var datasetCachePath: String? = nil
++    func latentCacheKey(_ input: Input, _ imageWidth: Int, _ imageHeight: Int) -> String {
++      return "\(input.imageUrl.path)|\(imageWidth)x\(imageHeight)"
++    }
++    if useDatasetCache {
++      var signature = ""
++      for input in inputs {
++        let attributes = try? FileManager.default.attributesOfItem(atPath: input.imageUrl.path)
++        let size = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
++        let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
++        signature += "\(input.imageUrl.path)|\(size)|\(modified)|\(input.caption)\n"
++      }
++      signature +=
++        "\(version)|\(autoencoder)|\(scale.widthScale)x\(scale.heightScale)|\(useImageAspectRatio)|\(customEmbeddingLength)"
++      let hash = stableLoRACacheHash(signature)
++      if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
++        let cacheDirectory = caches.appendingPathComponent("DrawThingsLoRA", isDirectory: true)
++        try? FileManager.default.createDirectory(
++          at: cacheDirectory, withIntermediateDirectories: true)
++        let cachePath = cacheDirectory.appendingPathComponent("latents-\(hash).store").path
++        datasetCachePath = cachePath
++        if FileManager.default.fileExists(atPath: cachePath) {
++          graph.openStore(cachePath, flags: [.readOnly]) { cacheStore in
++            for input in inputs {
++              guard let originalSize = imageInspector(input.imageUrl),
++                originalSize.width > 0 && originalSize.height > 0
++              else { continue }
++              let imageWidth: Int
++              let imageHeight: Int
++              if useImageAspectRatio {
++                let imageSize = Self.sizeThatFits(size: originalSize, scale: scale)
++                imageWidth = imageSize.width * 64
++                imageHeight = imageSize.height * 64
++              } else {
++                imageWidth = Int(scale.widthScale) * 64
++                imageHeight = Int(scale.heightScale) * 64
++              }
++              let key = latentCacheKey(input, imageWidth, imageHeight)
++              if let tensor = cacheStore.read(key) as? Tensor<FloatType> {
++                cachedLatents[key] = tensor
++              }
++            }
++          }
++        }
++      }
++    }
+     graph.openStore(session) { store in
+       // First, center crop and encode the image.
+       graph.withNoGrad {
+@@ -2271,16 +2321,26 @@ public struct LoRATrainer {
+             let (tensor, originalSize, cropTopLeft, targetSize) = imageLoader(
+               input.imageUrl, imageWidth, imageHeight)
+           else { continue }
+-          if previousImageWidth != imageWidth || previousImageHeight != imageHeight {
+-            encoder = nil  // Reload encoder.
+-          }
+-          // Keep this in the database.
+-          let tuple = firstStage.encode(
+-            graph.constant(tensor.toGPU(0)), encoder: encoder, cancellation: { _ in })
+-          let sample = tuple.0.rawValue.toCPU()
+-          encoder = tuple.1
+           let imagePath = input.imageUrl.path
+-          store.write(imagePath, tensor: sample)
++          let cacheKey = latentCacheKey(input, imageWidth, imageHeight)
++          if let cachedSample = cachedLatents[cacheKey] {
++            store.write(imagePath, tensor: cachedSample)
++          } else {
++            if previousImageWidth != imageWidth || previousImageHeight != imageHeight {
++              encoder = nil  // Reload encoder.
++            }
++            // Keep this in the database.
++            let tuple = firstStage.encode(
++              graph.constant(tensor.toGPU(0)), encoder: encoder, cancellation: { _ in })
++            let sample = tuple.0.rawValue.toCPU()
++            encoder = tuple.1
++            store.write(imagePath, tensor: sample)
++            if useDatasetCache {
++              newLatents[cacheKey] = sample
++            }
++          }
++          previousImageWidth = imageWidth
++          previousImageHeight = imageHeight
+           let (_, tokens, _, _, _) = tokenizer.tokenize(
+             text: input.caption, truncation: truncation, maxLength: tokenMaxLength)
+           var updatedTokens = [Int32]()
+@@ -2391,6 +2451,13 @@ public struct LoRATrainer {
+     if stopped {
+       return nil
+     }
++    if useDatasetCache, !newLatents.isEmpty, let cachePath = datasetCachePath {
++      graph.openStore(cachePath, flags: []) { cacheStore in
++        for (key, tensor) in newLatents {
++          cacheStore.write(key, tensor: tensor)
++        }
++      }
++    }
+     var dataFrame = DataFrame(from: processedInputs)
+     dataFrame["imagePath"] = dataFrame["0", ProcessedInput.self].map(\.imagePath)
+     dataFrame["tokens"] = dataFrame["0", ProcessedInput.self].map(\.tokens)
+@@ -7887,3 +7954,12 @@ public struct LoRATrainer {
+     }
+   }
+ }
++
++private func stableLoRACacheHash(_ string: String) -> String {
++  var hash: UInt64 = 0xcbf2_9ce4_8422_2325
++  for byte in string.utf8 {
++    hash ^= UInt64(byte)
++    hash = hash &* 0x0000_0100_0000_01b3
++  }
++  return String(hash, radix: 16)
++}
